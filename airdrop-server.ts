@@ -16,7 +16,7 @@ const AUTH_FILE   = process.env.MINT_AUTH_FILE || './devnet-mint.json';
 const MIN_CLAIM   = Number(process.env.MIN_CLAIM || '100');      // UI threshold
 const COORD       = (process.env.COORD || 'http://127.0.0.1:8787').replace(/\/$/, '');
 const DEV_NO_VERIFY = process.env.DEV_NO_VERIFY === '1';
-const DECIMALS    = 9n; // mint decimals (adjust if your mint differs)
+const DECIMALS    = 9n; // change if your mint decimals differ
 
 if (!MINT_ADDR) {
   console.error('MINT_ADDR env required');
@@ -30,7 +30,30 @@ const authority = Keypair.fromSecretKey(
 );
 
 const app = express();
-app.use(cors());
+app.set('trust proxy', 1);
+
+// CORS — same allow-list logic as coordinator
+const rawOrigins =
+  process.env.APP_ORIGINS ||
+  process.env.NEXT_PUBLIC_APP_ORIGIN ||
+  'http://localhost:3000';
+const ALLOWED_ORIGINS = rawOrigins.split(',').map(s => s.trim()).filter(Boolean);
+
+const corsOptions: cors.CorsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    const host = (() => { try { return new URL(origin).hostname; } catch { return ''; } })();
+    const ok =
+      ALLOWED_ORIGINS.includes(origin) ||
+      /\.vercel\.app$/.test(host);
+    return cb(ok ? null : new Error('CORS not allowed'), ok);
+  },
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','x-solana-signature'],
+  credentials: false,
+  maxAge: 86400
+};
+app.use(cors(corsOptions));
 app.use(bodyParser.json());
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
@@ -41,7 +64,7 @@ app.get('/healthz', (_req, res) => res.json({ ok: true }));
  *   msg := "CLAIM|<HOST_ID>|<WALLET>|<ts>"
  *   sig := base58(signature_over_msg)
  *
- * Dev fallback (not recommended for prod):
+ * Dev fallback (for testing only):
  * { wallet }  with DEV_NO_VERIFY=1
  */
 app.post('/claim', async (req, res) => {
@@ -58,7 +81,6 @@ app.post('/claim', async (req, res) => {
       if (!hostId || !msg || !sigB58) {
         return res.status(400).json({ ok: false, error: 'claim_signature_required' });
       }
-      // Expect exact shape: "CLAIM|<HOST_ID>|<WALLET>|<ts>"
       const expectedPrefix = `CLAIM|${hostId}|${wallet}|`;
       if (!msg.startsWith(expectedPrefix)) {
         return res.status(400).json({ ok: false, error: 'bad_claim_message' });
@@ -90,7 +112,7 @@ app.post('/claim', async (req, res) => {
     const baseUnits = BigInt(total) * 10n ** DECIMALS;
     const txSig = await mintTo(conn, authority, mint, ata.address, authority, baseUnits);
 
-    // --- 4) Settle/decrement credits on coordinator ---
+    // --- 4) Decrement credits on coordinator ---
     const rSettle = await fetch(`${COORD}/credits/settle`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -102,7 +124,7 @@ app.post('/claim', async (req, res) => {
     }
     const settled = (await rSettle.json()) as { ok: boolean; total: number };
 
-    // --- 5) Respond with tx and new total for UI to refresh immediately ---
+    // --- 5) Respond with tx and new total for UI to refresh ---
     return res.json({
       ok: true,
       tx: txSig,
